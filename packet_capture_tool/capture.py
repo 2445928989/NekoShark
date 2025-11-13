@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from typing import Callable, Optional
 
 try:
@@ -61,15 +63,20 @@ class CaptureManager:
         logging.info("Packet capture started with filter=%s iface=%s", filter_expr, iface)
 
     def stop(self) -> None:
-        logging.info("start stop")
         if self._sniffer is not None:
-            try:
-                self._sniffer.stop()
-                logging.info("Packet capture stopped")
-            finally:
-                self._sniffer = None
-                self._filter_expr = None
-                self._iface = None
+            def stop_sniffer():
+                try:
+                    self._sniffer.stop()
+                finally:
+                    self._sniffer = None
+                    self._filter_expr = None
+                    self._iface = None
+            stop_thread = threading.Thread(target=stop_sniffer)
+            stop_thread.start()
+            self._sniffer = None
+            self._filter_expr = None
+            self._iface = None
+            logging.info("Packet capture stopped")
 
     def restart(self, filter_expr: Optional[str] = None, iface: Optional[str] = None) -> None:
         self.stop()
