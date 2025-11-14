@@ -39,6 +39,13 @@ class PacketCaptureApp(tk.Tk):
         self.capture_manager = CaptureManager(self._on_packet_captured)
         self.resource_monitor = ResourceMonitor(self._on_resource_sample, interval=2.0)
 
+        # 优化参数：限制UI显示、批处理、限流
+        self._max_packets_display = 5000
+        self._stats_update_counter = 0
+        self._stats_update_interval = 10
+        self._pending_ui_update = False
+        self._display_offset = 0 
+
         self._build_ui()
         self.after(1000, self._update_uptime)
 
@@ -184,13 +191,19 @@ class PacketCaptureApp(tk.Tk):
         try:
             parsed = parse_packet(packet)
             self.packet_queue.put(parsed)
-            self.after(0, self._drain_packet_queue)
+            if not self._pending_ui_update:
+                self._pending_ui_update = True
+                self.after(50, self._drain_packet_queue)
         except Exception:
             logging.exception("Failed to parse packet")
 
     def _drain_packet_queue(self) -> None:
+        self._pending_ui_update = False
         updated = False
-        while True:
+        batch_count = 0
+        max_batch_size = 100
+        
+        while batch_count < max_batch_size:
             try:
                 packet = self.packet_queue.get_nowait()
             except queue.Empty:
@@ -198,16 +211,45 @@ class PacketCaptureApp(tk.Tk):
             else:
                 self.captured_packets.append(packet)
                 self.stats.register(packet)
+                self._stats_update_counter += 1
+                batch_count += 1
+                
                 index = len(self.captured_packets) - 1
-                self.packet_tree.insert(
-                    "",
-                    tk.END,
-                    iid=str(index),
-                    values=(packet.timestamp.strftime("%H:%M:%S"), packet.summary, ",".join(packet.protocols)),
-                )
-                updated = True
-        if updated:
-            self._refresh_statistics()
+                # 当前UI中显示的条目数
+                display_count = len(self.packet_tree.get_children())
+
+                # 始终使用捕获包的全局索引作为 iid，这样 selection 可以直接映射到 captured_packets
+                if display_count < self._max_packets_display:
+                    self.packet_tree.insert(
+                        "",
+                        tk.END,
+                        iid=str(index),
+                        values=(packet.timestamp.strftime("%H:%M:%S"), packet.summary, ",".join(packet.protocols)),
+                    )
+                    updated = True
+                else:
+                    # 超过显示上限：删除最旧的显示项（Treeview 中的第一项），然后插入新项（iid 为全局索引）
+                    children = self.packet_tree.get_children()
+                    if children:
+                        self.packet_tree.delete(children[0])
+                    self.packet_tree.insert(
+                        "",
+                        tk.END,
+                        iid=str(index),
+                        values=(packet.timestamp.strftime("%H:%M:%S"), packet.summary, ",".join(packet.protocols)),
+                    )
+                    updated = True
+        
+        # 限制图表更新频率，避免频繁重绘
+        if self._stats_update_counter >= self._stats_update_interval:
+            self._stats_update_counter = 0
+            if updated:
+                self._refresh_statistics()
+        
+        # 如果队列中还有数据，继续处理
+        if not self.packet_queue.empty():
+            self._pending_ui_update = True
+            self.after(50, self._drain_packet_queue)
 
     def _on_packet_selected(self, _event: object) -> None:
         selection = self.packet_tree.selection()
@@ -258,9 +300,8 @@ class PacketCaptureApp(tk.Tk):
         self.resource_monitor.start()
 
     def stop_capture(self) -> None:
-        logging.info("点击停止")
+        logging.info("停止抓包")
         self.capture_manager.stop()
-        logging.info("执行完毕")
         self.resource_monitor.stop()
         self.capture_start = None
         self.start_button.configure(state=tk.NORMAL)
@@ -269,23 +310,29 @@ class PacketCaptureApp(tk.Tk):
 
     # ------------------------------------------------------------------ Statistics & charts
     def _refresh_statistics(self) -> None:
-        # Update table
-        for item in self.stats_tree.get_children():
-            self.stats_tree.delete(item)
+        # 更新表格（增量更新，避免闪烁）
+        current_items = {item: self.stats_tree.item(item) for item in self.stats_tree.get_children()}
         for protocol, count in self.stats.table_rows():
-            self.stats_tree.insert("", tk.END, values=(protocol, count))
+            found = False
+            for item_id, item_data in current_items.items():
+                if item_data['values'][0] == protocol:
+                    self.stats_tree.item(item_id, values=(protocol, count))
+                    found = True
+                    break
+            if not found:
+                self.stats_tree.insert("", tk.END, values=(protocol, count))
 
-        # Update plots
+        # 更新图表
         ipv6_series = self.stats.ipv6_ratio_series()
-        self.ax_ipv6.clear()
-        self.ax_ipv6.set_title("IPv6 Traffic Percentage (last 24h)")
-        self.ax_ipv6.set_ylabel("IPv6 %")
         if ipv6_series:
+            self.ax_ipv6.clear()
+            self.ax_ipv6.set_title("IPv6 Traffic Percentage (last 24h)")
+            self.ax_ipv6.set_ylabel("IPv6 %")
             x = [ts for ts, _ in ipv6_series]
             y = [ratio for _, ratio in ipv6_series]
             self.ax_ipv6.plot_date(x, y, linestyle="solid", marker=None)
             self.ax_ipv6.set_ylim(0, 100)
-        self.ax_ipv6.grid(True, which="both", linestyle="--", alpha=0.5)
+            self.ax_ipv6.grid(True, which="both", linestyle="--", alpha=0.5)
 
         counters = self.stats.protocol_counters()
         self.ax_bar.clear()
@@ -333,16 +380,19 @@ class PacketCaptureApp(tk.Tk):
         self.captured_packets = packets
         self.stats.reset()
         self.packet_tree.delete(*self.packet_tree.get_children())
-        for idx, packet in enumerate(self.captured_packets):
+        # 只在UI中加载最后N个数据包
+        start_idx = max(0, len(packets) - self._max_packets_display)
+        for idx, packet in enumerate(packets):
             self.stats.register(packet)
-            self.packet_tree.insert(
-                "",
-                tk.END,
-                iid=str(idx),
-                values=(packet.timestamp.strftime("%H:%M:%S"), packet.summary, ",".join(packet.protocols)),
-            )
+            if idx >= start_idx:
+                self.packet_tree.insert(
+                    "",
+                    tk.END,
+                    iid=str(idx),
+                    values=(packet.timestamp.strftime("%H:%M:%S"), packet.summary, ",".join(packet.protocols)),
+                )
         self._refresh_statistics()
-        messagebox.showinfo("Loaded", f"Loaded {len(packets)} packets")
+        messagebox.showinfo("Loaded", f"Loaded {len(packets)} packets (displaying last {min(len(packets), self._max_packets_display)})")
 
     # ------------------------------------------------------------------ Resource monitoring
     def _on_resource_sample(self, sample: ResourceSample) -> None:

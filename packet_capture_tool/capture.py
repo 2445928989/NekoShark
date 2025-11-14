@@ -71,12 +71,15 @@ class CaptureManager:
                     self._sniffer = None
                     self._filter_expr = None
                     self._iface = None
-            stop_thread = threading.Thread(target=stop_sniffer)
+            
+            # 在后台线程中停止嗅探器，避免阻塞主线程
+            stop_thread = threading.Thread(target=stop_sniffer, daemon=True)
+            stop_thread.daemon = True
             stop_thread.start()
+            # 不阻塞等待，立即返回
             self._sniffer = None
             self._filter_expr = None
             self._iface = None
-            logging.info("Packet capture stopped")
 
     def restart(self, filter_expr: Optional[str] = None, iface: Optional[str] = None) -> None:
         self.stop()
