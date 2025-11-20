@@ -1,34 +1,37 @@
-"""基于 CustomTkinter 的数据包捕获与分析应用程序。"""
+"""基于 PyQt6 的数据包捕获与分析应用程序。"""
 from __future__ import annotations
-
 
 import json
 import logging
 import queue
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Deque, Tuple, Dict
+from collections import deque
 
-import customtkinter as ctk
-import tkinter as tk
-from tkinter import filedialog, messagebox
-from tkinter import ttk
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTableWidget, QTableWidgetItem, QPushButton, QLineEdit, QLabel,
+    QTabWidget, QTreeWidget, QTreeWidgetItem, QFileDialog, QMessageBox,
+    QHeaderView, QSplitter, QFrame, QCheckBox, QSpinBox, QGroupBox,
+    QDialog, QDialogButtonBox, QRadioButton, QButtonGroup
+)
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QSettings
+from PyQt6.QtGui import QFont, QColor, QPalette
 
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-import matplotlib.pyplot as plt
 import matplotlib
 
 # 配置 matplotlib 支持中文字符
 try:
-    # Windows 系统常用中文字体
     import platform
     if platform.system() == 'Windows':
         matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'SimSun', 'KaiTi']
     else:
-        # Linux/Mac 系统常用中文字体
         matplotlib.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'DejaVu Sans', 'Arial Unicode MS']
-    matplotlib.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+    matplotlib.rcParams['axes.unicode_minus'] = False
 except Exception:
     pass
 
@@ -36,33 +39,191 @@ from .capture import CaptureManager, CaptureUnavailableError
 from .packet_parser import ParsedPacket, parse_packet
 from .resource_monitor import ResourceMonitor, ResourceSample
 from .stats import TrafficStats
-from .storage import load_packets, save_packets
-
-# 设置 CustomTkinter 外观
-ctk.set_appearance_mode("light")  # 可选: "light", "dark", "system"
-ctk.set_default_color_theme("green")  # 可选: "blue", "green", "dark-blue"
-ctk.set_window_scaling(1.15)
-ctk.set_widget_scaling(1.25)
-
-ACCENT_COLOR = "#1f538d"
-LIGHT_PANEL_BG = "#f7f7f7"
-LIGHT_TEXT_COLOR = "#1f1f1f"
-TREE_BG_COLOR = "#ffffff"
-TREE_SELECTION_BG = "#cfe2ff"
-TREE_HEADER_BG = "#1f538d"
-TREE_HEADER_FG = "#ffffff"
+from .storage import load_packets, save_packets, RotatingJSONLWriter, read_all_jsonl_packets
 
 
-class PacketCaptureApp(ctk.CTk):
+class SettingsDialog(QDialog):
+    """设置对话框"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.setModal(True)
+        self.resize(500, 400)
+        
+        # 加载设置
+        self.settings = QSettings("PacketCaptureTool", "Settings")
+        
+        layout = QVBoxLayout(self)
+        
+        # 自动滚动设置
+        scroll_group = QGroupBox("自动滚动")
+        scroll_layout = QVBoxLayout()
+        
+        self.auto_scroll_checkbox = QCheckBox("在最新页且滚动条在底部时自动滚动到底部")
+        self.auto_scroll_checkbox.setChecked(self.settings.value("auto_scroll", True, type=bool))
+        scroll_layout.addWidget(self.auto_scroll_checkbox)
+        
+        scroll_group.setLayout(scroll_layout)
+        layout.addWidget(scroll_group)
+        
+        # 自动换页设置
+        page_group = QGroupBox("自动换页")
+        page_layout = QVBoxLayout()
+        
+        self.auto_page_checkbox = QCheckBox("在最新页时，新数据导致页数增加时自动跳转到新页")
+        self.auto_page_checkbox.setChecked(self.settings.value("auto_page", True, type=bool))
+        page_layout.addWidget(self.auto_page_checkbox)
+        
+        page_group.setLayout(page_layout)
+        layout.addWidget(page_group)
+        
+        # 批处理大小设置
+        batch_group = QGroupBox("性能设置")
+        batch_layout = QVBoxLayout()
+        
+        batch_label_layout = QHBoxLayout()
+        batch_label_layout.addWidget(QLabel("每次处理的数据包批量大小:"))
+        self.batch_size_spinbox = QSpinBox()
+        self.batch_size_spinbox.setRange(10, 1000)
+        self.batch_size_spinbox.setValue(self.settings.value("batch_size", 100, type=int))
+        self.batch_size_spinbox.setSuffix(" 个")
+        batch_label_layout.addWidget(self.batch_size_spinbox)
+        batch_label_layout.addStretch()
+        batch_layout.addLayout(batch_label_layout)
+        
+        batch_help = QLabel("较大的批量可以提高性能，但可能导致界面更新延迟")
+        batch_help.setStyleSheet("color: gray; font-size: 11px;")
+        batch_layout.addWidget(batch_help)
+        
+        batch_group.setLayout(batch_layout)
+        layout.addWidget(batch_group)
+        
+        # 缓存设置
+        cache_group = QGroupBox("缓存设置")
+        cache_layout = QVBoxLayout()
+        
+        cache_label_layout = QHBoxLayout()
+        cache_label_layout.addWidget(QLabel("内存缓存数据包数量:"))
+        self.cache_size_spinbox = QSpinBox()
+        self.cache_size_spinbox.setRange(100, 50000)
+        self.cache_size_spinbox.setValue(self.settings.value("cache_size", 5000, type=int))
+        self.cache_size_spinbox.setSuffix(" 个")
+        cache_label_layout.addWidget(self.cache_size_spinbox)
+        cache_label_layout.addStretch()
+        cache_layout.addLayout(cache_label_layout)
+        
+        cache_help = QLabel("较大的缓存可以减少磁盘读取，但会占用更多内存")
+        cache_help.setStyleSheet("color: gray; font-size: 11px;")
+        cache_layout.addWidget(cache_help)
+        
+        cache_group.setLayout(cache_layout)
+        layout.addWidget(cache_group)
+        
+        # 主题设置
+        theme_group = QGroupBox("界面主题")
+        theme_layout = QVBoxLayout()
+        
+        self.light_theme_radio = QRadioButton("明色主题")
+        self.dark_theme_radio = QRadioButton("暗色主题")
+        
+        self.theme_button_group = QButtonGroup()
+        self.theme_button_group.addButton(self.light_theme_radio)
+        self.theme_button_group.addButton(self.dark_theme_radio)
+        
+        current_theme = self.settings.value("theme", "dark", type=str)
+        if current_theme == "dark":
+            self.dark_theme_radio.setChecked(True)
+        else:
+            self.light_theme_radio.setChecked(True)
+        
+        theme_layout.addWidget(self.light_theme_radio)
+        theme_layout.addWidget(self.dark_theme_radio)
+        
+        theme_help = QLabel("更改主题将在应用设置后立即生效")
+        theme_help.setStyleSheet("color: gray; font-size: 11px;")
+        theme_layout.addWidget(theme_help)
+        
+        theme_group.setLayout(theme_layout)
+        layout.addWidget(theme_group)
+        
+        layout.addStretch()
+        
+        # 按钮
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | 
+            QDialogButtonBox.StandardButton.Cancel |
+            QDialogButtonBox.StandardButton.RestoreDefaults
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        button_box.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(self.restore_defaults)
+        layout.addWidget(button_box)
+    
+    def restore_defaults(self):
+        """恢复默认设置"""
+        self.auto_scroll_checkbox.setChecked(True)
+        self.auto_page_checkbox.setChecked(True)
+        self.batch_size_spinbox.setValue(100)
+        self.cache_size_spinbox.setValue(5000)
+        self.dark_theme_radio.setChecked(True)
+    
+    def save_settings(self):
+        """保存设置"""
+        self.settings.setValue("auto_scroll", self.auto_scroll_checkbox.isChecked())
+        self.settings.setValue("auto_page", self.auto_page_checkbox.isChecked())
+        self.settings.setValue("batch_size", self.batch_size_spinbox.value())
+        self.settings.setValue("cache_size", self.cache_size_spinbox.value())
+        theme = "dark" if self.dark_theme_radio.isChecked() else "light"
+        self.settings.setValue("theme", theme)
+    
+    def get_settings(self):
+        """获取设置"""
+        theme = "dark" if self.dark_theme_radio.isChecked() else "light"
+        return {
+            "auto_scroll": self.auto_scroll_checkbox.isChecked(),
+            "auto_page": self.auto_page_checkbox.isChecked(),
+            "batch_size": self.batch_size_spinbox.value(),
+            "cache_size": self.cache_size_spinbox.value(),
+            "theme": theme
+        }
+
+
+class PacketSignals(QObject):
+    """信号类，用于线程间通信"""
+    packet_captured = pyqtSignal(object)
+    resource_sample = pyqtSignal(object)
+
+
+class PacketCaptureApp(QMainWindow):
     """主图形界面应用程序。"""
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("数据包捕获与分析工具")
-        self.geometry("1400x900")
+        self.setWindowTitle("数据包捕获与分析工具")
+        self.resize(1400, 900)
+
+        # 加载设置
+        self.settings = QSettings("PacketCaptureTool", "Settings")
+        self._auto_scroll_enabled = self.settings.value("auto_scroll", True, type=bool)
+        self._auto_page_enabled = self.settings.value("auto_page", True, type=bool)
+        self._batch_size_setting = self.settings.value("batch_size", 100, type=int)
+        self._ui_cache_size = self.settings.value("cache_size", 5000, type=int)
+
+        # 信号
+        self.signals = PacketSignals()
+        self.signals.packet_captured.connect(self._on_packet_captured_slot)
+        self.signals.resource_sample.connect(self._on_resource_sample_slot)
 
         self.packet_queue: "queue.Queue[ParsedPacket]" = queue.Queue()
-        self.captured_packets: List[ParsedPacket] = []
+        self.captured_packets: Deque[Tuple[int, ParsedPacket]] = deque(maxlen=self._ui_cache_size)
+        self._packet_cache: Dict[int, ParsedPacket] = {}
+        self._packet_global_index = 0
+        self._capture_session_name: Optional[str] = None
+        self._jsonl_writer: Optional[RotatingJSONLWriter] = None
+        self._resource_jsonl_writer: Optional[RotatingJSONLWriter] = None
+        self._new_packets_since_page = 0
+        self._pending_page_reload = False
         self.resource_samples: List[ResourceSample] = []
         self.stats = TrafficStats(window=timedelta(days=1))
         self.capture_start: Optional[datetime] = None
@@ -70,590 +231,1056 @@ class PacketCaptureApp(ctk.CTk):
         self.capture_manager = CaptureManager(self._on_packet_captured)
         self.resource_monitor = ResourceMonitor(self._on_resource_sample, interval=2.0)
 
-        # 优化参数：限制UI显示、批处理、限流
-        self._max_packets_display = 5000
         self._stats_update_counter = 0
         self._stats_update_interval = 10
         self._pending_ui_update = False
-        self._display_offset = 0 
+
+        # 分页参数
+        self._page_size = 100
+        self._current_page = 1
+        
+        # 网络监控
+        self._last_packet_time = None
+        self._network_check_enabled = False
+        self._last_packet_count = 0
+        
+        # 显示过滤器
+        self._display_filter_pattern = None
+        self._display_filter_enabled = False
 
         self._build_ui()
-        self.after(1000, self._update_uptime)
 
-    # ------------------------------------------------------------------ UI
+        # 应用主题
+        self._apply_theme(self.settings.value("theme", "dark", type=str))
+
+        # 定时器
+        self.uptime_timer = QTimer()
+        self.uptime_timer.timeout.connect(self._update_uptime)
+        self.uptime_timer.start(1000)
+
+        self.queue_timer = QTimer()
+        self.queue_timer.timeout.connect(self._drain_packet_queue)
+        self.queue_timer.start(50)
+        
+        # 网络状态检测定时器，每30秒检查一次
+        self.network_check_timer = QTimer()
+        self.network_check_timer.timeout.connect(self._check_network_status)
+        self.network_check_timer.start(30000)  # 30秒
+
     def _build_ui(self) -> None:
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(0, weight=1)
+        """构建UI"""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
 
-        # 主容器使用 CTkFrame
-        main_container = ctk.CTkFrame(self, fg_color=LIGHT_PANEL_BG)
-        main_container.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        main_container.grid_columnconfigure(0, weight=3)
-        main_container.grid_columnconfigure(1, weight=5)
-        main_container.grid_rowconfigure(1, weight=1)
-
-        # 顶部控制面板（跨两列）
-        control_frame = ctk.CTkFrame(main_container)
-        control_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
-        control_frame.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(control_frame, text="BPF 过滤器:", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, sticky="w", padx=5, pady=3)
-        self.filter_var = tk.StringVar()
-        filter_entry = ctk.CTkEntry(control_frame, textvariable=self.filter_var, placeholder_text="例如: tcp port 80", font=ctk.CTkFont(size=14))
-        filter_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=3)
-
-        # 按钮行1
-        button_frame1 = ctk.CTkFrame(control_frame)
-        button_frame1.grid(row=0, column=2, padx=3, pady=3)
-        self.start_button = ctk.CTkButton(button_frame1, text="▶ 开始捕获", command=self.start_capture, 
-                                          fg_color="#2fa572", hover_color="#228B22", width=140, 
-                                          font=ctk.CTkFont(size=14, weight="bold"))
-        self.start_button.pack(side=tk.LEFT, padx=2)
-        self.stop_button = ctk.CTkButton(button_frame1, text="⏹ 停止", command=self.stop_capture, 
-                                        state=tk.DISABLED, fg_color="#d32f2f", hover_color="#b71c1c", width=120,
-                                        font=ctk.CTkFont(size=14, weight="bold"))
-        self.stop_button.pack(side=tk.LEFT, padx=2)
-
+        # 顶部控制面板
+        control_frame = QFrame()
+        control_layout = QVBoxLayout(control_frame)
+        
+        # 过滤器行
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("BPF 过滤器:"))
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("例如: tcp port 80")
+        filter_layout.addWidget(self.filter_input)
+        
+        # 按钮
+        self.start_button = QPushButton("▶ 开始捕获")
+        self.start_button.clicked.connect(self.start_capture)
+        self.start_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2fa572;
+                color: white;
+                font-weight: bold;
+                padding: 6px 12px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #278d5f;
+            }
+            QPushButton:pressed {
+                background-color: #1e6b47;
+            }
+            QPushButton:disabled {
+                background-color: #9e9e9e;
+                color: #e0e0e0;
+            }
+        """)
+        filter_layout.addWidget(self.start_button)
+        
+        self.stop_button = QPushButton("⏹ 停止")
+        self.stop_button.clicked.connect(self.stop_capture)
+        self.stop_button.setEnabled(False)
+        self.stop_button.setStyleSheet("""
+            QPushButton {
+                background-color: #d32f2f;
+                color: white;
+                font-weight: bold;
+                padding: 6px 12px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #b71c1c;
+            }
+            QPushButton:pressed {
+                background-color: #8b0000;
+            }
+            QPushButton:disabled {
+                background-color: #9e9e9e;
+                color: #e0e0e0;
+            }
+        """)
+        filter_layout.addWidget(self.stop_button)
+        
+        control_layout.addLayout(filter_layout)
+        
+        # 显示过滤器行（正则表达式）
+        display_filter_layout = QHBoxLayout()
+        display_filter_layout.addWidget(QLabel("显示过滤器:"))
+        self.display_filter_input = QLineEdit()
+        self.display_filter_input.setPlaceholderText(r"正则表达式，例如: 192\.168\..*|tcp.*80")
+        self.display_filter_input.textChanged.connect(self._on_display_filter_changed)
+        display_filter_layout.addWidget(self.display_filter_input)
+        
+        clear_filter_button = QPushButton("✖ 清除")
+        clear_filter_button.clicked.connect(lambda: self.display_filter_input.clear())
+        clear_filter_button.setMaximumWidth(60)
+        display_filter_layout.addWidget(clear_filter_button)
+        
+        self.filter_status_label = QLabel("")
+        self.filter_status_label.setStyleSheet("color: green; font-size: 11px;")
+        display_filter_layout.addWidget(self.filter_status_label)
+        
+        control_layout.addLayout(display_filter_layout)
+        
         # 按钮行2
-        button_frame2 = ctk.CTkFrame(control_frame)
-        button_frame2.grid(row=1, column=0, columnspan=3, pady=3)
-        self.save_button = ctk.CTkButton(button_frame2, text="💾 保存捕获", command=self.save_capture, 
-                                        width=140, font=ctk.CTkFont(size=14))
-        self.save_button.pack(side=tk.LEFT, padx=3)
-        self.load_button = ctk.CTkButton(button_frame2, text="📂 加载捕获", command=self.load_capture, 
-                                        width=140, font=ctk.CTkFont(size=14))
-        self.load_button.pack(side=tk.LEFT, padx=3)
-
-        # 左侧面板
-        left_frame = ctk.CTkFrame(main_container, fg_color=LIGHT_PANEL_BG)
-        left_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 5), pady=(0, 5))
-        left_frame.grid_rowconfigure(0, weight=1)
-        left_frame.grid_columnconfigure(0, weight=1)
-
-        # 右侧面板
-        right_frame = ctk.CTkFrame(main_container, fg_color=LIGHT_PANEL_BG)
-        right_frame.grid(row=1, column=1, sticky="nsew", padx=(5, 0), pady=(0, 5))
-        right_frame.grid_columnconfigure(0, weight=1)
-        right_frame.grid_rowconfigure(0, weight=1)
-
-        # 数据包列表
-        packet_frame = ctk.CTkFrame(left_frame, fg_color=LIGHT_PANEL_BG)
-        packet_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=(0, 5))
-        packet_frame.grid_rowconfigure(1, weight=1)
-        packet_frame.grid_columnconfigure(0, weight=1)
-
-        # 列表标题
-        list_header = ctk.CTkFrame(packet_frame)
-        list_header.grid(row=0, column=0, sticky="ew", padx=3, pady=3)
-        list_header.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(list_header, text="📦 捕获的数据包", font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, sticky="w", padx=8, pady=3)
-
-        # Treeview 容器
-        tree_container = ctk.CTkFrame(packet_frame, fg_color=LIGHT_PANEL_BG)
-        tree_container.grid(row=1, column=0, sticky="nsew", padx=3, pady=3)
-        tree_container.grid_rowconfigure(0, weight=1)
-        tree_container.grid_columnconfigure(0, weight=1)
-
-        columns = ("time", "summary", "protocols")
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure(
-            "Capture.Treeview",
-            background=TREE_BG_COLOR,
-            foreground=LIGHT_TEXT_COLOR,
-            fieldbackground=TREE_BG_COLOR,
-            font=("Microsoft YaHei", 19),
-            rowheight=48,
-        )
-        style.configure(
-            "Capture.Treeview.Heading",
-            background=TREE_HEADER_BG,
-            foreground=TREE_HEADER_FG,
-            font=("Microsoft YaHei", 22, "bold"),
-        )
-        style.map(
-            "Capture.Treeview",
-            background=[("selected", TREE_SELECTION_BG)],
-            foreground=[("selected", LIGHT_TEXT_COLOR)],
-        )
-
-        self.packet_tree = ttk.Treeview(tree_container, columns=columns, show="headings", height=20, style="Capture.Treeview")
-        self.packet_tree.heading("time", text="时间")
-        self.packet_tree.heading("summary", text="摘要")
-        self.packet_tree.heading("protocols", text="协议")
-        self.packet_tree.column("time", width=140, anchor=tk.W)
-        self.packet_tree.column("summary", width=400)
-        self.packet_tree.column("protocols", width=120)
-        self.packet_tree.bind("<<TreeviewSelect>>", self._on_packet_selected)
-
-        scroll = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.packet_tree.yview)
-        self.packet_tree.configure(yscrollcommand=scroll.set)
-        self.packet_tree.grid(row=0, column=0, sticky="nsew")
-        scroll.grid(row=0, column=1, sticky="ns")
-
-        # 右侧标签页
-        notebook_style = ttk.Style()
-        notebook_style.theme_use("clam")
-        notebook_style.configure(
-            "RightNotebook.TNotebook",
-            background=LIGHT_PANEL_BG,
-            borderwidth=0,
-            tabmargins=(0, 0, 0, 0),
-        )
-        notebook_style.configure(
-            "RightNotebook.TNotebook.Tab",
-            font=("Microsoft YaHei", 16, "bold"),
-            padding=(18, 10),
-            background=LIGHT_PANEL_BG,
-            foreground=LIGHT_TEXT_COLOR,
-        )
-        notebook_style.map(
-            "RightNotebook.TNotebook.Tab",
-            background=[("selected", ACCENT_COLOR), ("!selected", LIGHT_PANEL_BG)],
-            foreground=[("selected", "#ffffff"), ("!selected", LIGHT_TEXT_COLOR)],
-        )
-
-        notebook = ttk.Notebook(right_frame, style="RightNotebook.TNotebook")
-        notebook.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-
-        self.details_tab = ctk.CTkFrame(notebook, fg_color=LIGHT_PANEL_BG)
-        self.stats_tab = ctk.CTkFrame(notebook, fg_color=LIGHT_PANEL_BG)
-        self.resource_tab = ctk.CTkFrame(notebook, fg_color=LIGHT_PANEL_BG)
-        notebook.add(self.details_tab, text="📋 数据包详情")
-        notebook.add(self.stats_tab, text="📊 统计信息")
-        notebook.add(self.resource_tab, text="💻 资源监控")
-
-        self._build_details_tab()
-        self._build_stats_tab()
-        self._build_resource_tab()
-
-    def _build_details_tab(self) -> None:
-        self.details_tab.grid_columnconfigure(0, weight=1)
-        self.details_tab.grid_rowconfigure(0, weight=1)
+        button_layout = QHBoxLayout()
+        save_button = QPushButton("💾 保存捕获")
+        save_button.clicked.connect(self.save_capture)
+        button_layout.addWidget(save_button)
         
-        tree_frame = ctk.CTkFrame(self.details_tab, fg_color=LIGHT_PANEL_BG)
-        tree_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        tree_frame.grid_columnconfigure(0, weight=1)
-        tree_frame.grid_rowconfigure(0, weight=1)
-
-        tree_style = ttk.Style()
-        tree_style.configure(
-            "Details.Treeview",
-            background=TREE_BG_COLOR,
-            foreground=LIGHT_TEXT_COLOR,
-            fieldbackground=TREE_BG_COLOR,
-            font=("Microsoft YaHei", 16),
-            rowheight=32,
-        )
-        tree_style.configure(
-            "Details.Treeview.Heading",
-            font=("Microsoft YaHei", 17, "bold"),
-            background=TREE_HEADER_BG,
-            foreground=TREE_HEADER_FG,
-        )
-        tree_style.map(
-            "Details.Treeview",
-            background=[("selected", TREE_SELECTION_BG)],
-            foreground=[("selected", LIGHT_TEXT_COLOR)],
-        )
-
-        self.details_tree = ttk.Treeview(
-            tree_frame,
-            columns=("value",),
-            show="tree headings",
-            style="Details.Treeview",
-        )
-        self.details_tree.heading("#0", text="字段")
-        self.details_tree.heading("value", text="内容")
-        self.details_tree.column("#0", width=220, anchor=tk.W, stretch=True)
-        self.details_tree.column("value", width=400, anchor=tk.W, stretch=True)
-        self.details_tree.grid(row=0, column=0, sticky="nsew", padx=3, pady=3)
-
-        tree_scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.details_tree.yview)
-        self.details_tree.configure(yscrollcommand=tree_scroll_y.set)
-        tree_scroll_y.grid(row=0, column=1, sticky="ns", pady=3)
-
-    def _build_stats_tab(self) -> None:
-        self.stats_tab.grid_columnconfigure(0, weight=1)
-        self.stats_tab.grid_rowconfigure(0, weight=0)
-        self.stats_tab.grid_rowconfigure(1, weight=1)
+        load_button = QPushButton("📂 加载捕获")
+        load_button.clicked.connect(self.load_capture)
+        button_layout.addWidget(load_button)
         
-        stats_top = ctk.CTkFrame(self.stats_tab, fg_color=LIGHT_PANEL_BG)
-        stats_top.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
-        stats_top.grid_columnconfigure(0, weight=1)
-
-        # 统计表格容器
-        table_container = ctk.CTkFrame(stats_top, fg_color=LIGHT_PANEL_BG)
-        table_container.grid(row=0, column=0, sticky="ew", padx=3, pady=3)
-        table_container.grid_columnconfigure(0, weight=1)
-
-        columns = ("protocol", "count")
-        self.stats_tree = ttk.Treeview(table_container, columns=columns, show="headings", height=4, style="Capture.Treeview")
-        self.stats_tree.heading("protocol", text="协议")
-        self.stats_tree.heading("count", text="数据包数")
-        self.stats_tree.column("protocol", width=120)
-        self.stats_tree.column("count", width=100, anchor=tk.E)
-        self.stats_tree.grid(row=0, column=0, sticky="ew")
-
-        stats_scroll = ttk.Scrollbar(table_container, orient=tk.VERTICAL, command=self.stats_tree.yview)
-        self.stats_tree.configure(yscrollcommand=stats_scroll.set)
-        stats_scroll.grid(row=0, column=1, sticky="ns")
-
-        # 图表容器
-        chart_frame = ctk.CTkFrame(self.stats_tab, fg_color=LIGHT_PANEL_BG)
-        chart_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
-        chart_frame.grid_columnconfigure(0, weight=1)
-        chart_frame.grid_rowconfigure(0, weight=1)
-
-        figure = Figure(figsize=(8, 5), dpi=100, facecolor="#ffffff")
-        self.ax_ipv6 = figure.add_subplot(211)
-        self.ax_ipv6.set_title("IPv6 流量占比（最近24小时）", color=LIGHT_TEXT_COLOR, fontsize=14, fontweight='bold')
-        self.ax_ipv6.set_ylabel("IPv6 %", color=LIGHT_TEXT_COLOR, fontsize=13)
-        self.ax_ipv6.set_facecolor("#ffffff")
-        self.ax_ipv6.tick_params(colors=LIGHT_TEXT_COLOR, labelsize=11)
-        for spine in self.ax_ipv6.spines.values():
-            spine.set_color(LIGHT_TEXT_COLOR)
-
-        self.ax_bar = figure.add_subplot(212)
-        self.ax_bar.set_title("TCP/UDP/ARP 分布", color=LIGHT_TEXT_COLOR, fontsize=14, fontweight='bold')
-        self.ax_bar.set_ylabel("数据包数", color=LIGHT_TEXT_COLOR, fontsize=13)
-        self.ax_bar.set_facecolor("#ffffff")
-        self.ax_bar.tick_params(colors=LIGHT_TEXT_COLOR, labelsize=11)
-        for spine in self.ax_bar.spines.values():
-            spine.set_color(LIGHT_TEXT_COLOR)
-
-        self.canvas = FigureCanvasTkAgg(figure, master=chart_frame)
-        self.canvas.draw()
-        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-
-    def _build_resource_tab(self) -> None:
-        self.resource_tab.grid_columnconfigure(0, weight=1)
-        self.resource_tab.grid_rowconfigure(1, weight=1)
+        settings_button = QPushButton("⚙️ 设置")
+        settings_button.clicked.connect(self.open_settings)
+        button_layout.addWidget(settings_button)
         
-        info_frame = ctk.CTkFrame(self.resource_tab, fg_color=LIGHT_PANEL_BG)
-        info_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
-        info_frame.grid_columnconfigure(0, weight=1)
+        # 网络状态指示器
+        self.network_status_label = QLabel("● 未开始")
+        self.network_status_label.setStyleSheet("""
+            QLabel {
+                color: gray;
+                font-weight: bold;
+                padding: 6px 12px;
+                border-radius: 4px;
+                background-color: rgba(128, 128, 128, 0.1);
+            }
+        """)
+        button_layout.addWidget(self.network_status_label)
+        
+        button_layout.addStretch()
+        
+        control_layout.addLayout(button_layout)
+        main_layout.addWidget(control_frame)
 
-        self.start_time_var = tk.StringVar(value="开始时间: -")
-        self.uptime_var = tk.StringVar(value="运行时长: 0秒")
-        ctk.CTkLabel(info_frame, textvariable=self.start_time_var, 
-                    font=ctk.CTkFont(size=14)).grid(row=0, column=0, sticky="w", padx=8, pady=3)
-        ctk.CTkLabel(info_frame, textvariable=self.uptime_var, 
-                    font=ctk.CTkFont(size=14)).grid(row=1, column=0, sticky="w", padx=8, pady=3)
+        # 主分割器
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # 左侧：数据包列表
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        
+        left_layout.addWidget(QLabel("📦 捕获的数据包"))
+        
+        # 数据包表格
+        self.packet_table = QTableWidget()
+        self.packet_table.setColumnCount(3)
+        self.packet_table.setHorizontalHeaderLabels(["时间", "摘要", "协议"])
+        # 固定列宽，防止抖动
+        self.packet_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.packet_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.packet_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.packet_table.setColumnWidth(0, 160)
+        self.packet_table.setColumnWidth(2, 150)
+        # 优化性能
+        self.packet_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.packet_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.packet_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)  # 禁止编辑
+        self.packet_table.verticalHeader().setVisible(False)  # 隐藏行号
+        self.packet_table.setShowGrid(True)  # 显示网格
+        # 强制垂直滚动条始终显示，防止宽度变化
+        self.packet_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.packet_table.itemSelectionChanged.connect(self._on_packet_selected)
+        left_layout.addWidget(self.packet_table)
+        
+        # 分页控件
+        pagination_layout = QHBoxLayout()
+        pagination_layout.addWidget(QLabel("每页记录:"))
+        self.page_size_input = QLineEdit("100")
+        self.page_size_input.setMaximumWidth(60)
+        pagination_layout.addWidget(self.page_size_input)
+        
+        self.prev_button = QPushButton("◀")
+        self.prev_button.clicked.connect(self._on_prev_page)
+        pagination_layout.addWidget(self.prev_button)
+        
+        self.load_page_button = QPushButton("加载页面")
+        self.load_page_button.clicked.connect(self._on_load_page)
+        pagination_layout.addWidget(self.load_page_button)
+        
+        self.next_button = QPushButton("▶")
+        self.next_button.clicked.connect(self._on_next_page)
+        pagination_layout.addWidget(self.next_button)
+        
+        self.page_label = QLabel("记录: -")
+        pagination_layout.addWidget(self.page_label)
+        pagination_layout.addStretch()
+        
+        left_layout.addLayout(pagination_layout)
+        
+        # 右侧：标签页
+        self.tab_widget = QTabWidget()
+        
+        # 详情标签页
+        self.details_tree = QTreeWidget()
+        self.details_tree.setHeaderLabels(["字段", "内容"])
+        self.details_tree.setColumnWidth(0, 220)
+        self.tab_widget.addTab(self.details_tree, "📋 数据包详情")
+        
+        # 统计标签页
+        stats_widget = QWidget()
+        stats_layout = QVBoxLayout(stats_widget)
+        
+        self.stats_table = QTableWidget()
+        self.stats_table.setColumnCount(2)
+        self.stats_table.setHorizontalHeaderLabels(["协议", "数据包数"])
+        self.stats_table.setMinimumHeight(140)
+        self.stats_table.setMaximumHeight(300)
+        stats_layout.addWidget(self.stats_table)
+        
+        # 图表
+        self.figure = Figure(figsize=(8, 6))
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.figure.subplots_adjust(hspace=0.4, top=0.95, bottom=0.08, left=0.1, right=0.95)
+        self.ax_ipv6 = self.figure.add_subplot(211)
+        self.ax_bar = self.figure.add_subplot(212)
+        stats_layout.addWidget(self.canvas)
+        
+        self.tab_widget.addTab(stats_widget, "📊 统计信息")
+        
+        # 资源监控标签页
+        resource_widget = QWidget()
+        resource_layout = QVBoxLayout(resource_widget)
+        
+        # 顶部信息栏
+        info_layout = QHBoxLayout()
+        self.start_time_label = QLabel("开始时间: -")
+        self.uptime_label = QLabel("运行时长: 0秒")
+        info_layout.addWidget(self.start_time_label)
+        info_layout.addWidget(self.uptime_label)
+        info_layout.addStretch()
+        
+        export_resource_button = QPushButton("📥 导出资源日志")
+        export_resource_button.clicked.connect(self.export_resource_log)
+        info_layout.addWidget(export_resource_button)
+        
+        resource_layout.addLayout(info_layout)
+        
+        # 资源图表
+        self.resource_figure = Figure(figsize=(8, 6))
+        self.resource_canvas = FigureCanvasQTAgg(self.resource_figure)
+        self.resource_figure.subplots_adjust(hspace=0.4, top=0.95, bottom=0.1, left=0.1, right=0.95)
+        self.ax_cpu = self.resource_figure.add_subplot(211)
+        self.ax_memory = self.resource_figure.add_subplot(212)
+        resource_layout.addWidget(self.resource_canvas)
+        
+        self.tab_widget.addTab(resource_widget, "💻 资源监控")
+        
+        # 添加到分割器
+        splitter.addWidget(left_widget)
+        splitter.addWidget(self.tab_widget)
+        splitter.setSizes([600, 800])
+        
+        main_layout.addWidget(splitter)
 
-        # 资源表格容器
-        resource_table_frame = ctk.CTkFrame(self.resource_tab, fg_color=LIGHT_PANEL_BG)
-        resource_table_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
-        resource_table_frame.grid_columnconfigure(0, weight=1)
-        resource_table_frame.grid_rowconfigure(0, weight=1)
+    def open_settings(self):
+        """打开设置对话框"""
+        dialog = SettingsDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            dialog.save_settings()
+            # 应用新设置
+            new_settings = dialog.get_settings()
+            self._auto_scroll_enabled = new_settings["auto_scroll"]
+            self._auto_page_enabled = new_settings["auto_page"]
+            old_batch_size = self._batch_size_setting
+            self._batch_size_setting = new_settings["batch_size"]
+            
+            # 如果缓存大小改变，需要重新创建 deque
+            if new_settings["cache_size"] != self._ui_cache_size:
+                self._ui_cache_size = new_settings["cache_size"]
+                # 保留现有数据，只改变最大长度
+                old_packets = list(self.captured_packets)
+                self.captured_packets = deque(old_packets, maxlen=self._ui_cache_size)
+            
+            # 应用主题设置
+            self._apply_theme(new_settings["theme"])
+            
+            QMessageBox.information(self, "设置已保存", "设置已成功保存并应用！")
 
-        self.resource_tree = ttk.Treeview(
-            resource_table_frame,
-            columns=("time", "cpu", "memory"),
-            show="headings",
-            height=12,
-            style="Capture.Treeview",
-        )
-        self.resource_tree.heading("time", text="时间戳")
-        self.resource_tree.heading("cpu", text="CPU %")
-        self.resource_tree.heading("memory", text="内存 (MB)")
-        self.resource_tree.column("time", width=180)
-        self.resource_tree.column("cpu", width=100, anchor=tk.E)
-        self.resource_tree.column("memory", width=130, anchor=tk.E)
-        self.resource_tree.grid(row=0, column=0, sticky="nsew", padx=3, pady=3)
+    def _on_display_filter_changed(self, text: str):
+        """显示过滤器文本变化"""
+        import re
+        if not text.strip():
+            self._display_filter_pattern = None
+            self._display_filter_enabled = False
+            self.filter_status_label.setText("✓ 过滤器已禁用")
+            self.filter_status_label.setStyleSheet("color: gray; font-size: 11px;")
+            self._on_load_page()  # 重新加载页面
+            return
+        
+        try:
+            self._display_filter_pattern = re.compile(text, re.IGNORECASE)
+            self._display_filter_enabled = True
+            self.filter_status_label.setText("✓ 过滤器有效")
+            self.filter_status_label.setStyleSheet("color: green; font-size: 11px;")
+            self._on_load_page()  # 重新加载页面
+        except re.error as e:
+            self._display_filter_pattern = None
+            self._display_filter_enabled = False
+            self.filter_status_label.setText(f"✖ 正则错误: {str(e)}")
+            self.filter_status_label.setStyleSheet("color: red; font-size: 11px;")
+    
+    def _packet_matches_filter(self, packet: ParsedPacket) -> bool:
+        """检查数据包是否匹配显示过滤器"""
+        if not self._display_filter_enabled or not self._display_filter_pattern:
+            return True
+        
+        # 搜索范围：摘要、协议、网络层、传输层
+        search_text = packet.summary + " " + " ".join(packet.protocols)
+        for value in packet.network_layer.values():
+            search_text += " " + str(value)
+        for value in packet.transport_layer.values():
+            search_text += " " + str(value)
+        
+        return bool(self._display_filter_pattern.search(search_text))
 
-        resource_scroll = ttk.Scrollbar(resource_table_frame, orient=tk.VERTICAL, command=self.resource_tree.yview)
-        self.resource_tree.configure(yscrollcommand=resource_scroll.set)
-        resource_scroll.grid(row=0, column=1, sticky="ns")
+    def _apply_theme(self, theme: str):
+        """应用明色或暗色主题"""
+        palette = QPalette()
+        
+        if theme == "dark":
+            # 暗色主题
+            palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
+            palette.setColor(QPalette.ColorRole.WindowText, QColor(255, 255, 255))
+            palette.setColor(QPalette.ColorRole.Base, QColor(35, 35, 35))
+            palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
+            palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(25, 25, 25))
+            palette.setColor(QPalette.ColorRole.ToolTipText, QColor(255, 255, 255))
+            palette.setColor(QPalette.ColorRole.Text, QColor(255, 255, 255))
+            palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
+            palette.setColor(QPalette.ColorRole.ButtonText, QColor(255, 255, 255))
+            palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
+            palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
+            palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+            palette.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
+        else:
+            # 明色主题 (系统默认)
+            palette.setColor(QPalette.ColorRole.Window, QColor(240, 240, 240))
+            palette.setColor(QPalette.ColorRole.WindowText, QColor(0, 0, 0))
+            palette.setColor(QPalette.ColorRole.Base, QColor(255, 255, 255))
+            palette.setColor(QPalette.ColorRole.AlternateBase, QColor(245, 245, 245))
+            palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(255, 255, 220))
+            palette.setColor(QPalette.ColorRole.ToolTipText, QColor(0, 0, 0))
+            palette.setColor(QPalette.ColorRole.Text, QColor(0, 0, 0))
+            palette.setColor(QPalette.ColorRole.Button, QColor(240, 240, 240))
+            palette.setColor(QPalette.ColorRole.ButtonText, QColor(0, 0, 0))
+            palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
+            palette.setColor(QPalette.ColorRole.Link, QColor(0, 0, 255))
+            palette.setColor(QPalette.ColorRole.Highlight, QColor(0, 120, 215))
+            palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+        
+        QApplication.instance().setPalette(palette)
 
-        button_frame = ctk.CTkFrame(self.resource_tab, fg_color=LIGHT_PANEL_BG)
-        button_frame.grid(row=2, column=0, pady=5)
-        export_button = ctk.CTkButton(button_frame, text="📥 导出资源日志", command=self.export_resource_log, 
-                                     width=160, font=ctk.CTkFont(size=14))
-        export_button.pack(pady=3)
+    def _apply_theme(self, theme: str):
+        """应用明色或暗色主题"""
+        palette = QPalette()
+        
+        if theme == "dark":
+            # 暗色主题
+            palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
+            palette.setColor(QPalette.ColorRole.WindowText, QColor(255, 255, 255))
+            palette.setColor(QPalette.ColorRole.Base, QColor(35, 35, 35))
+            palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
+            palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(25, 25, 25))
+            palette.setColor(QPalette.ColorRole.ToolTipText, QColor(255, 255, 255))
+            palette.setColor(QPalette.ColorRole.Text, QColor(255, 255, 255))
+            palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
+            palette.setColor(QPalette.ColorRole.ButtonText, QColor(255, 255, 255))
+            palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
+            palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
+            palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+            palette.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
+        else:
+            # 明色主题 (系统默认)
+            palette.setColor(QPalette.ColorRole.Window, QColor(240, 240, 240))
+            palette.setColor(QPalette.ColorRole.WindowText, QColor(0, 0, 0))
+            palette.setColor(QPalette.ColorRole.Base, QColor(255, 255, 255))
+            palette.setColor(QPalette.ColorRole.AlternateBase, QColor(245, 245, 245))
+            palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(255, 255, 220))
+            palette.setColor(QPalette.ColorRole.ToolTipText, QColor(0, 0, 0))
+            palette.setColor(QPalette.ColorRole.Text, QColor(0, 0, 0))
+            palette.setColor(QPalette.ColorRole.Button, QColor(240, 240, 240))
+            palette.setColor(QPalette.ColorRole.ButtonText, QColor(0, 0, 0))
+            palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
+            palette.setColor(QPalette.ColorRole.Link, QColor(0, 0, 255))
+            palette.setColor(QPalette.ColorRole.Highlight, QColor(0, 120, 215))
+            palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+        
+        QApplication.instance().setPalette(palette)
 
-        if not ResourceMonitor.is_available():
-            ctk.CTkLabel(
-                self.resource_tab,
-                text="⚠️ psutil 未安装，资源监控不可用",
-                text_color="red",
-                font=ctk.CTkFont(size=14, weight="bold")
-            ).grid(row=3, column=0, pady=5)
 
-    # ------------------------------------------------------------------ Packet handling
+    # ------------------------------------------------------------------ 分页逻辑
+    def _update_page_label(self, start_idx: int = None, end_idx: int = None) -> None:
+        last_index = max(-1, self._packet_global_index - 1)
+        if last_index < 0:
+            self.page_label.setText("记录: -")
+            return
+        total = last_index + 1
+        total_pages = (total + self._page_size - 1) // self._page_size
+        if start_idx is None or end_idx is None:
+            start = (self._current_page - 1) * self._page_size
+            end = min(start + self._page_size - 1, last_index)
+        else:
+            start, end = start_idx, end_idx
+        label = f"记录: {start} → {end} (页 {self._current_page}/{total_pages})"
+        if self._new_packets_since_page and self._current_page < total_pages:
+            label += f"  新: {self._new_packets_since_page}"
+        self.page_label.setText(label)
+
+    def _on_load_page(self) -> None:
+        try:
+            self._page_size = max(1, int(self.page_size_input.text()))
+        except:
+            self._page_size = 100
+        
+        last_index = self._packet_global_index - 1
+        if last_index < 0:
+            self.packet_table.setRowCount(0)
+            self._current_page = 1
+            self._update_page_label()
+            return
+        
+        total = last_index + 1
+        total_pages = (total + self._page_size - 1) // self._page_size
+        self._current_page = total_pages
+        
+        start = (self._current_page - 1) * self._page_size
+        end = min(start + self._page_size - 1, last_index)
+        self._new_packets_since_page = 0
+        self._load_page_by_index(start, end)
+
+    def _on_prev_page(self) -> None:
+        if self._current_page > 1:
+            self._current_page -= 1
+            last_index = self._packet_global_index - 1
+            if last_index < 0:
+                return
+            start = (self._current_page - 1) * self._page_size
+            end = min(start + self._page_size - 1, last_index)
+            total = last_index + 1
+            total_pages = (total + self._page_size - 1) // self._page_size
+            if self._current_page == total_pages:
+                self._new_packets_since_page = 0
+            self._load_page_by_index(start, end)
+
+    def _on_next_page(self) -> None:
+        last_index = self._packet_global_index - 1
+        if last_index < 0:
+            return
+        total = last_index + 1
+        total_pages = (total + self._page_size - 1) // self._page_size
+        if self._current_page < total_pages:
+            self._current_page += 1
+            start = (self._current_page - 1) * self._page_size
+            end = min(start + self._page_size - 1, last_index)
+            if self._current_page == total_pages:
+                self._new_packets_since_page = 0
+            self._load_page_by_index(start, end)
+
+    def _load_page_by_index(self, start_idx: int, end_idx: int) -> None:
+        """按索引范围加载页面"""
+        # 检查是否在底部（用于自动滚动）
+        scrollbar = self.packet_table.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10  # 留10像素容差
+        
+        results = []
+
+        try:
+            if self._capture_session_name:
+                # 从所有轮转文件中读取指定范围的数据包
+                captures_dir = Path.cwd() / "captures"
+                all_packets = read_all_jsonl_packets(captures_dir, self._capture_session_name)
+                for idx, pkt in all_packets:
+                    if start_idx <= idx <= end_idx:
+                        results.append((idx, pkt))
+            else:
+                # 从内存缓存读取
+                for idx, pkt in self.captured_packets:
+                    if start_idx <= idx <= end_idx:
+                        results.append((idx, pkt))
+        except:
+            logging.exception("按索引加载页面失败")
+
+        results.sort(key=lambda x: x[0])
+        
+        # 应用显示过滤器
+        if self._display_filter_enabled:
+            filtered_results = [(idx, pkt) for idx, pkt in results if self._packet_matches_filter(pkt)]
+            results = filtered_results
+        
+        # 完全禁用更新以避免任何视觉闪烁
+        self.packet_table.setUpdatesEnabled(False)
+        self.packet_table.blockSignals(True)
+        
+        # 直接设置行数（一次性操作）
+        self.packet_table.setRowCount(len(results))
+        
+        # 更新所有单元格
+        for row, (idx, packet) in enumerate(results):
+            # 时间列
+            time_item = QTableWidgetItem(packet.timestamp.strftime("%H:%M:%S"))
+            time_item.setData(Qt.ItemDataRole.UserRole, idx)
+            time_item.setFlags(time_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.packet_table.setItem(row, 0, time_item)
+            
+            # 摘要列
+            summary_item = QTableWidgetItem(packet.summary)
+            summary_item.setFlags(summary_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.packet_table.setItem(row, 1, summary_item)
+            
+            # 协议列
+            protocol_item = QTableWidgetItem(",".join(packet.protocols))
+            protocol_item.setFlags(protocol_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.packet_table.setItem(row, 2, protocol_item)
+        
+        # 重新启用更新（一次性刷新）
+        self.packet_table.blockSignals(False)
+        self.packet_table.setUpdatesEnabled(True)
+
+        self._update_page_label(start_idx, end_idx)
+        
+        # 如果启用了自动滚动且之前在底部且在最新页，自动滚动到底部
+        if self._auto_scroll_enabled:
+            last_index = self._packet_global_index - 1
+            if last_index >= 0:
+                total = last_index + 1
+                total_pages = (total + self._page_size - 1) // self._page_size
+                if was_at_bottom and self._current_page == total_pages:
+                    self.packet_table.scrollToBottom()
+
+    # ------------------------------------------------------------------ 数据包处理
     def _on_packet_captured(self, packet: object) -> None:
+        """在捕获线程中调用"""
         try:
             parsed = parse_packet(packet)
-            self.packet_queue.put(parsed)
-            if not self._pending_ui_update:
-                self._pending_ui_update = True
-                self.after(50, self._drain_packet_queue)
-        except Exception:
+            self.signals.packet_captured.emit(parsed)
+        except:
             logging.exception("解析数据包失败")
 
+    def _on_packet_captured_slot(self, packet: ParsedPacket) -> None:
+        """在主线程中调用"""
+        self.packet_queue.put(packet)
+
     def _drain_packet_queue(self) -> None:
-        self._pending_ui_update = False
-        updated = False
         batch_count = 0
-        max_batch_size = 100
-        
+        max_batch_size = self._batch_size_setting
+
         while batch_count < max_batch_size:
             try:
                 packet = self.packet_queue.get_nowait()
             except queue.Empty:
                 break
-            else:
-                self.captured_packets.append(packet)
-                self.stats.register(packet)
-                self._stats_update_counter += 1
-                batch_count += 1
-                
-                index = len(self.captured_packets) - 1
-                # 当前UI中显示的条目数
-                display_count = len(self.packet_tree.get_children())
 
-                # 始终使用捕获包的全局索引作为 iid，这样 selection 可以直接映射到 captured_packets
-                if display_count < self._max_packets_display:
-                    self.packet_tree.insert(
-                        "",
-                        tk.END,
-                        iid=str(index),
-                        values=(packet.timestamp.strftime("%H:%M:%S"), packet.summary, ",".join(packet.protocols)),
-                    )
-                    updated = True
+            index = self._packet_global_index
+            
+            # 更新最后收到包的时间
+            self._last_packet_time = datetime.now()
+            self._last_packet_count = index + 1
+
+            # 写入 JSONL（轮转式）
+            try:
+                if self._jsonl_writer:
+                    payload = {"index": index, "data": packet.to_json()}
+                    self._jsonl_writer.write(payload)
+            except:
+                logging.exception("写入 JSONL 失败")
+
+            self.stats.register(packet)
+            self._stats_update_counter += 1
+            batch_count += 1
+
+            # 内存缓存管理
+            try:
+                if self.captured_packets.maxlen and len(self.captured_packets) >= self.captured_packets.maxlen:
+                    oldest_index, _ = self.captured_packets.popleft()
+                    if oldest_index in self._packet_cache:
+                        del self._packet_cache[oldest_index]
+            except:
+                pass
+
+            self.captured_packets.append((index, packet))
+            self._packet_cache[index] = packet
+
+            # 判断是否需要刷新页面
+            try:
+                last_index = index
+                total = last_index + 1
+                prev_total = last_index
+                prev_total_pages = (prev_total + self._page_size - 1) // self._page_size if prev_total > 0 else 1
+                total_pages = (total + self._page_size - 1) // self._page_size
+
+                # 使用设置中的自动换页选项
+                if self._auto_page_enabled and self._current_page == prev_total_pages and total_pages > prev_total_pages:
+                    self._current_page = total_pages
+                    self._pending_page_reload = True
+                elif self._current_page == total_pages:
+                    current_page_start = (self._current_page - 1) * self._page_size
+                    current_page_end = min(current_page_start + self._page_size - 1, last_index)
+                    if current_page_start <= index <= current_page_end:
+                        self._pending_page_reload = True
                 else:
-                    # 超过显示上限：删除最旧的显示项（Treeview 中的第一项），然后插入新项（iid 为全局索引）
-                    children = self.packet_tree.get_children()
-                    if children:
-                        self.packet_tree.delete(children[0])
-                    self.packet_tree.insert(
-                        "",
-                        tk.END,
-                        iid=str(index),
-                        values=(packet.timestamp.strftime("%H:%M:%S"), packet.summary, ",".join(packet.protocols)),
-                    )
-                    updated = True
-        
-        # 限制图表更新频率，避免频繁重绘
+                    if self._current_page < total_pages:
+                        self._new_packets_since_page += 1
+                        self._update_page_label()
+            except:
+                pass
+
+            self._packet_global_index += 1
+
+        # 统计更新
         if self._stats_update_counter >= self._stats_update_interval:
             self._stats_update_counter = 0
-            if updated:
-                self._refresh_statistics()
-        
-        # 如果队列中还有数据，继续处理
-        if not self.packet_queue.empty():
-            self._pending_ui_update = True
-            self.after(50, self._drain_packet_queue)
+            self._refresh_statistics()
 
-    def _on_packet_selected(self, _event: object) -> None:
-        selection = self.packet_tree.selection()
+        # 刷新页面
+        if self._pending_page_reload:
+            self._pending_page_reload = False
+            self._on_load_page()
+
+    def _on_packet_selected(self) -> None:
+        selection = self.packet_table.selectedItems()
         if not selection:
             return
-        idx = int(selection[0])
-        packet = self.captured_packets[idx]
-        self._display_packet_details(packet)
+        row = self.packet_table.currentRow()
+        if row < 0:
+            return
+        
+        idx = self.packet_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        packet = self._get_packet_by_global_index(idx)
+        
+        if packet:
+            self._display_packet_details(packet)
 
     def _display_packet_details(self, packet: ParsedPacket) -> None:
-        # 更新树形视图
-        self.details_tree.delete(*self.details_tree.get_children())
-        general = self.details_tree.insert("", tk.END, text="概览", open=True)
-        self.details_tree.insert(general, tk.END, text="捕获时间", values=(packet.timestamp,))
-        self.details_tree.insert(general, tk.END, text="摘要", values=(packet.summary,))
-        self.details_tree.insert(general, tk.END, text="协议链路", values=(", ".join(packet.protocols)))
-
-        network_node = self.details_tree.insert("", tk.END, text="网络层", open=True)
+        self.details_tree.clear()
+        
+        general = QTreeWidgetItem(self.details_tree, ["概览", ""])
+        QTreeWidgetItem(general, ["捕获时间", str(packet.timestamp)])
+        QTreeWidgetItem(general, ["摘要", packet.summary])
+        QTreeWidgetItem(general, ["协议链路", ", ".join(packet.protocols)])
+        general.setExpanded(True)
+        
+        network = QTreeWidgetItem(self.details_tree, ["网络层", ""])
         if packet.network_layer:
             for key, value in packet.network_layer.items():
-                self.details_tree.insert(network_node, tk.END, text=key, values=(value,))
+                QTreeWidgetItem(network, [key, str(value)])
         else:
-            self.details_tree.insert(network_node, tk.END, text="无", values=("",))
-
-        transport_node = self.details_tree.insert("", tk.END, text="传输层", open=True)
+            QTreeWidgetItem(network, ["无", ""])
+        network.setExpanded(True)
+        
+        transport = QTreeWidgetItem(self.details_tree, ["传输层", ""])
         if packet.transport_layer:
             for key, value in packet.transport_layer.items():
-                self.details_tree.insert(transport_node, tk.END, text=key, values=(value,))
+                QTreeWidgetItem(transport, [key, str(value)])
         else:
-            self.details_tree.insert(transport_node, tk.END, text="无", values=("",))
-
+            QTreeWidgetItem(transport, ["无", ""])
+        transport.setExpanded(True)
+        
         if packet.dns_info:
-            dns_node = self.details_tree.insert("", tk.END, text="DNS", open=True)
+            dns = QTreeWidgetItem(self.details_tree, ["DNS", ""])
             for key, value in packet.dns_info.items():
-                self.details_tree.insert(dns_node, tk.END, text=key, values=(value,))
+                QTreeWidgetItem(dns, [key, str(value)])
+            dns.setExpanded(True)
 
+    def _get_packet_by_global_index(self, index: int) -> Optional[ParsedPacket]:
+        if index in self._packet_cache:
+            return self._packet_cache[index]
 
-    # ------------------------------------------------------------------ Capture controls
-    def start_capture(self) -> None:
-        filter_expr = self.filter_var.get().strip() or None
         try:
-            self.capture_manager.start(filter_expr=filter_expr)
-        except CaptureUnavailableError as exc:
-            messagebox.showerror("捕获不可用", str(exc))
-            return
-        except Exception as exc:  # pragma: no cover - safety
-            messagebox.showerror("捕获错误", str(exc))
-            return
+            if self._capture_session_name:
+                # 从所有轮转文件中查找
+                captures_dir = Path.cwd() / "captures"
+                all_packets = read_all_jsonl_packets(captures_dir, self._capture_session_name)
+                for idx, pkt in all_packets:
+                    if idx == index:
+                        return pkt
+        except:
+            logging.exception("从 JSONL 加载包失败")
 
+        return None
+
+    # ------------------------------------------------------------------ 捕获控制
+    def start_capture(self) -> None:
+        self.start_button.setEnabled(False)
+        self.start_button.setText("⏳ 启动中...")
+
+        filter_expr = self.filter_input.text().strip() or None
+
+        def _start_capture_thread():
+            try:
+                self.capture_manager.start(filter_expr=filter_expr)
+                QTimer.singleShot(0, self._on_capture_started)
+            except CaptureUnavailableError as exc:
+                QTimer.singleShot(0, lambda: self._on_capture_error("捕获不可用", str(exc)))
+            except Exception as exc:
+                QTimer.singleShot(0, lambda: self._on_capture_error("捕获错误", str(exc)))
+
+        thread = threading.Thread(target=_start_capture_thread, daemon=True)
+        thread.start()
+
+    def _on_capture_started(self) -> None:
         self.capture_start = datetime.now()
-        self.start_button.configure(state=tk.DISABLED)
-        self.stop_button.configure(state=tk.NORMAL, fg_color="#d32f2f", hover_color="#b71c1c")
-        self.start_time_var.set(f"开始时间: {self.capture_start.strftime('%Y-%m-%d %H:%M:%S')}")
+        self.start_button.setText("▶ 开始捕获")
+        self.stop_button.setEnabled(True)
+        self.start_time_label.setText(f"开始时间: {self.capture_start.strftime('%Y-%m-%d %H:%M:%S')}")
         self.resource_monitor.start()
+        
+        # 启用网络监控
+        self._network_check_enabled = True
+        self._last_packet_time = datetime.now()
+        self._last_packet_count = 0
+        self._update_network_status("normal")
+        
+        try:
+            captures_dir = Path.cwd() / "captures"
+            captures_dir.mkdir(parents=True, exist_ok=True)
+            self._capture_session_name = self.capture_start.strftime("capture_%Y%m%d_%H%M%S")
+            # 创建数据包轮转式写入器，单文件最大 50MB
+            self._jsonl_writer = RotatingJSONLWriter(
+                base_dir=captures_dir,
+                session_name=self._capture_session_name,
+                max_file_size=50 * 1024 * 1024  # 50MB
+            )
+            # 创建资源监控轮转式写入器，单文件最大 10MB
+            self._resource_jsonl_writer = RotatingJSONLWriter(
+                base_dir=captures_dir,
+                session_name=f"resource_{self._capture_session_name}",
+                max_file_size=10 * 1024 * 1024  # 10MB
+            )
+        except:
+            logging.exception("无法创建轮转式 JSONL 写入器")
+
+    def _on_capture_error(self, title: str, message: str) -> None:
+        QMessageBox.critical(self, title, message)
+        self.start_button.setEnabled(True)
+        self.start_button.setText("▶ 开始捕获")
 
     def stop_capture(self) -> None:
         logging.info("停止抓包")
         self.capture_manager.stop()
         self.resource_monitor.stop()
         self.capture_start = None
-        self.start_button.configure(state=tk.NORMAL, fg_color="#2fa572", hover_color="#228B22")
-        self.stop_button.configure(state=tk.DISABLED)
-        self.uptime_var.set("运行时长: 0秒")
+        self._network_check_enabled = False
+        self._update_network_status("stopped")
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.uptime_label.setText("运行时长: 0秒")
+        
+        try:
+            if self._jsonl_writer:
+                self._jsonl_writer.close()
+                self._jsonl_writer = None
+            if self._resource_jsonl_writer:
+                self._resource_jsonl_writer.close()
+                self._resource_jsonl_writer = None
+        except:
+            pass
+        finally:
+            self._capture_jsonl_file = None
+            self._capture_jsonl_path = None
 
-    # ------------------------------------------------------------------ Statistics & charts
+    # ------------------------------------------------------------------ 统计
     def _refresh_statistics(self) -> None:
-        # 更新表格（增量更新，避免闪烁）
-        current_items = {item: self.stats_tree.item(item) for item in self.stats_tree.get_children()}
-        for protocol, count in self.stats.table_rows():
-            found = False
-            for item_id, item_data in current_items.items():
-                if item_data['values'][0] == protocol:
-                    self.stats_tree.item(item_id, values=(protocol, count))
-                    found = True
-                    break
-            if not found:
-                self.stats_tree.insert("", tk.END, values=(protocol, count))
+        # 更新表格 - 显示所有有数据的协议
+        stats_data = list(self.stats.table_rows())
+        # 添加总数
+        stats_data.insert(0, ("总计", self.stats.total_packets))
+        self.stats_table.setRowCount(len(stats_data))
+        for row, (protocol, count) in enumerate(stats_data):
+            protocol_item = QTableWidgetItem(protocol)
+            if protocol == "总计":
+                protocol_item.setData(Qt.ItemDataRole.FontRole, QFont("", -1, QFont.Weight.Bold))
+            self.stats_table.setItem(row, 0, protocol_item)
+            
+            count_item = QTableWidgetItem(str(count))
+            if protocol == "总计":
+                count_item.setData(Qt.ItemDataRole.FontRole, QFont("", -1, QFont.Weight.Bold))
+            self.stats_table.setItem(row, 1, count_item)
 
         # 更新图表
         ipv6_series = self.stats.ipv6_ratio_series()
         if ipv6_series:
             self.ax_ipv6.clear()
-            self.ax_ipv6.set_facecolor("#ffffff")
-            self.ax_ipv6.set_title("IPv6 流量占比（最近24小时）", color=LIGHT_TEXT_COLOR, fontsize=14, fontweight='bold')
-            self.ax_ipv6.set_ylabel("IPv6 %", color=LIGHT_TEXT_COLOR, fontsize=13)
-            self.ax_ipv6.tick_params(colors=LIGHT_TEXT_COLOR, labelsize=11)
-            for spine in self.ax_ipv6.spines.values():
-                spine.set_color(LIGHT_TEXT_COLOR)
+            self.ax_ipv6.set_title("IPv6 流量占比（最近24小时）")
+            self.ax_ipv6.set_ylabel("IPv6 %")
             x = [ts for ts, _ in ipv6_series]
             y = [ratio for _, ratio in ipv6_series]
-            self.ax_ipv6.plot_date(x, y, linestyle="solid", marker=None, color="#4A9EFF")
+            self.ax_ipv6.plot_date(x, y, "-")
             self.ax_ipv6.set_ylim(0, 100)
-            self.ax_ipv6.grid(True, which="both", linestyle="--", alpha=0.3, color="#c0c0c0")
+            self.ax_ipv6.grid(True)
 
         counters = self.stats.protocol_counters()
         self.ax_bar.clear()
-        self.ax_bar.set_facecolor("#ffffff")
-        self.ax_bar.set_title("TCP/UDP/ARP 分布", color=LIGHT_TEXT_COLOR, fontsize=14, fontweight='bold')
-        self.ax_bar.set_ylabel("数据包数", color=LIGHT_TEXT_COLOR, fontsize=13)
-        self.ax_bar.tick_params(colors=LIGHT_TEXT_COLOR, labelsize=11)
-        for spine in self.ax_bar.spines.values():
-            spine.set_color(LIGHT_TEXT_COLOR)
+        self.ax_bar.set_title("TCP/UDP/ARP 分布")
+        self.ax_bar.set_ylabel("数据包数")
         labels = ["TCP", "UDP", "ARP"]
         values = [counters.get(label, 0) for label in labels]
-        self.ax_bar.bar(labels, values, color=["#4A9EFF", "#FF9500", "#2ECC71"])
-        self.ax_bar.grid(axis="y", linestyle="--", alpha=0.3, color="#c0c0c0")
+        self.ax_bar.bar(labels, values)
+        self.ax_bar.grid(axis="y")
 
-        self.canvas.draw_idle()
+        self.canvas.draw()
 
-    # ------------------------------------------------------------------ Persistence
+    # ------------------------------------------------------------------ 持久化
     def save_capture(self) -> None:
-        if not self.captured_packets:
-            messagebox.showinfo("无数据", "暂无数据包可保存。")
+        has_any = bool(self.captured_packets) or (self._capture_jsonl_path and self._capture_jsonl_path.exists())
+        if not has_any:
+            QMessageBox.information(self, "无数据", "暂无数据包可保存。")
             return
-        file_path = filedialog.asksaveasfilename(
-            title="保存捕获的数据包",
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json")],
-        )
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "保存捕获的数据包", "", "JSON Files (*.json)")
         if not file_path:
             return
+
         try:
-            save_packets(Path(file_path), self.captured_packets)
+            all_packets: List[ParsedPacket] = []
+            if self._capture_session_name:
+                # 从所有轮转文件中读取
+                captures_dir = Path.cwd() / "captures"
+                indexed_packets = read_all_jsonl_packets(captures_dir, self._capture_session_name)
+                all_packets = [pkt for _, pkt in indexed_packets]
+            else:
+                # 从内存缓存读取
+                for _, pkt in sorted(self.captured_packets, key=lambda x: x[0]):
+                    all_packets.append(pkt)
+
+            save_packets(Path(file_path), all_packets)
+            QMessageBox.information(self, "已保存", f"捕获数据已保存到 {file_path}")
         except Exception as exc:
-            messagebox.showerror("保存错误", str(exc))
-        else:
-            messagebox.showinfo("已保存", f"捕获数据已保存到 {file_path}")
+            QMessageBox.critical(self, "保存错误", str(exc))
 
     def load_capture(self) -> None:
-        file_path = filedialog.askopenfilename(
-            title="打开捕获文件",
-            filetypes=[("JSON", "*.json"), ("所有文件", "*.*")],
-        )
+        file_path, _ = QFileDialog.getOpenFileName(self, "打开捕获文件", "", "JSON Files (*.json)")
         if not file_path:
             return
+        
         try:
             packets = load_packets(Path(file_path))
         except Exception as exc:
-            messagebox.showerror("加载错误", str(exc))
+            QMessageBox.critical(self, "加载错误", str(exc))
             return
 
-        self.captured_packets = packets
         self.stats.reset()
-        self.packet_tree.delete(*self.packet_tree.get_children())
-        # 只在UI中加载最后N个数据包
-        start_idx = max(0, len(packets) - self._max_packets_display)
+        self.packet_table.setRowCount(0)
+        self.captured_packets = deque(maxlen=self._ui_cache_size)
+        self._packet_cache.clear()
+        self._packet_global_index = 0
+
         for idx, packet in enumerate(packets):
             self.stats.register(packet)
-            if idx >= start_idx:
-                self.packet_tree.insert(
-                    "",
-                    tk.END,
-                    iid=str(idx),
-                    values=(packet.timestamp.strftime("%H:%M:%S"), packet.summary, ",".join(packet.protocols)),
-                )
+            self.captured_packets.append((idx, packet))
+            self._packet_cache[idx] = packet
+            self._packet_global_index = idx + 1
+
         self._refresh_statistics()
-        messagebox.showinfo("已加载", f"已加载 {len(packets)} 个数据包（显示最后 {min(len(packets), self._max_packets_display)} 个）")
+        QMessageBox.information(self, "已加载", f"已加载 {len(packets)} 个数据包")
 
-    # ------------------------------------------------------------------ Resource monitoring
+    # ------------------------------------------------------------------ 资源监控
     def _on_resource_sample(self, sample: ResourceSample) -> None:
-        self.resource_samples.append(sample)
-        self.after(0, lambda: self._append_resource_sample(sample))
+        self.signals.resource_sample.emit(sample)
 
-    def _append_resource_sample(self, sample: ResourceSample) -> None:
-        timestamp = sample.timestamp.strftime("%H:%M:%S")
-        self.resource_tree.insert("", tk.END, values=(timestamp, f"{sample.cpu_percent:.2f}", f"{sample.memory_mb:.2f}"))
-        # 限制UI中只显示最后200个样本
-        children = self.resource_tree.get_children()
-        if len(children) > 200:
-            self.resource_tree.delete(children[0])
-
-    def export_resource_log(self) -> None:
-        if not self.resource_samples:
-            messagebox.showinfo("无样本", "尚未捕获资源样本。")
-            return
-        file_path = filedialog.asksaveasfilename(
-            title="导出资源使用情况",
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json")],
-        )
-        if not file_path:
-            return
+    def _on_resource_sample_slot(self, sample: ResourceSample) -> None:
+        # 写入 JSONL 轮转文件
         try:
-            payload = [
-                {
+            if self._resource_jsonl_writer:
+                payload = {
                     "timestamp": sample.timestamp.isoformat(),
                     "cpu_percent": sample.cpu_percent,
                     "memory_mb": sample.memory_mb,
                 }
-                for sample in self.resource_samples
-            ]
+                self._resource_jsonl_writer.write(payload)
+        except:
+            logging.exception("写入资源监控 JSONL 失败")
+        
+        # 保持最近 200 条在内存中（用于图表显示）
+        self.resource_samples.append(sample)
+        if len(self.resource_samples) > 200:
+            self.resource_samples.pop(0)
+        
+        # 更新资源图表
+        self._update_resource_charts()
+
+    def export_resource_log(self) -> None:
+        if not self._capture_session_name:
+            QMessageBox.information(self, "无样本", "尚未开始资源监控。")
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出资源使用情况", "", "JSON Files (*.json)")
+        if not file_path:
+            return
+        
+        try:
+            # 从所有轮转文件中读取资源数据
+            captures_dir = Path.cwd() / "captures"
+            pattern = f"resource_{self._capture_session_name}_*.jsonl"
+            files = sorted(captures_dir.glob(pattern))
+            
+            payload = []
+            for filepath in files:
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if not line.strip():
+                                continue
+                            try:
+                                obj = json.loads(line)
+                                payload.append(obj)
+                            except:
+                                continue
+                except:
+                    continue
+            
+            if not payload:
+                QMessageBox.information(self, "无样本", "未找到资源监控数据。")
+                return
+            
             Path(file_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            QMessageBox.information(self, "已导出", f"资源日志已保存到 {file_path}")
         except Exception as exc:
-            messagebox.showerror("导出错误", str(exc))
-        else:
-            messagebox.showinfo("已导出", f"资源日志已保存到 {file_path}")
+            QMessageBox.critical(self, "导出错误", str(exc))
+    
+    def _update_resource_charts(self) -> None:
+        """更新资源监控图表"""
+        if len(self.resource_samples) < 2:
+            return
+        
+        try:
+            # 提取数据
+            timestamps = [sample.timestamp for sample in self.resource_samples]
+            cpu_values = [sample.cpu_percent for sample in self.resource_samples]
+            memory_values = [sample.memory_mb for sample in self.resource_samples]
+            
+            # CPU 图表
+            self.ax_cpu.clear()
+            self.ax_cpu.set_title("CPU 使用率（最近 200 个样本）")
+            self.ax_cpu.set_ylabel("CPU %")
+            self.ax_cpu.plot(timestamps, cpu_values, "-", color="#2196F3", linewidth=1.5)
+            self.ax_cpu.grid(True, alpha=0.3)
+            self.ax_cpu.set_ylim(0, max(cpu_values) * 1.2 if cpu_values else 10)
+            
+            # 内存图表
+            self.ax_memory.clear()
+            self.ax_memory.set_title("内存使用量（最近 200 个样本）")
+            self.ax_memory.set_ylabel("内存 (MB)")
+            self.ax_memory.set_xlabel("时间")
+            self.ax_memory.plot(timestamps, memory_values, "-", color="#4CAF50", linewidth=1.5)
+            self.ax_memory.grid(True, alpha=0.3)
+            self.ax_memory.set_ylim(0, max(memory_values) * 1.2 if memory_values else 100)
+            
+            # 旋转 x 轴标签
+            self.ax_memory.tick_params(axis='x', rotation=45)
+            
+            self.resource_canvas.draw()
+        except Exception as e:
+            logging.warning(f"更新资源图表失败: {e}")
 
     def _update_uptime(self) -> None:
         if self.capture_start:
             delta = datetime.now() - self.capture_start
-            self.uptime_var.set(f"运行时长: {str(delta).split('.')[0]}")
-        self.after(1000, self._update_uptime)
+            self.uptime_label.setText(f"运行时长: {str(delta).split('.')[0]}")
+    
+    def _update_network_status(self, status: str):
+        """更新网络状态指示器"""
+        if status == "normal":
+            self.network_status_label.setText("● 正常")
+            self.network_status_label.setStyleSheet("""
+                QLabel {
+                    color: #2fa572;
+                    font-weight: bold;
+                    padding: 6px 12px;
+                    border-radius: 4px;
+                    background-color: rgba(47, 165, 114, 0.1);
+                }
+            """)
+        elif status == "warning":
+            self.network_status_label.setText("● 可能断网")
+            self.network_status_label.setStyleSheet("""
+                QLabel {
+                    color: #ff9800;
+                    font-weight: bold;
+                    padding: 6px 12px;
+                    border-radius: 4px;
+                    background-color: rgba(255, 152, 0, 0.1);
+                }
+            """)
+        else:  # stopped
+            self.network_status_label.setText("● 未开始")
+            self.network_status_label.setStyleSheet("""
+                QLabel {
+                    color: gray;
+                    font-weight: bold;
+                    padding: 6px 12px;
+                    border-radius: 4px;
+                    background-color: rgba(128, 128, 128, 0.1);
+                }
+            """)
+    
+    def _check_network_status(self) -> None:
+        """检查网络状态，如果超过60秒没有收到包，可能是断网了"""
+        if not self._network_check_enabled or not self.capture_start:
+            return
+        
+        if self._last_packet_time is None:
+            return
+        
+        time_since_last_packet = (datetime.now() - self._last_packet_time).total_seconds()
+        
+        # 如果超过60秒没有收到新包，且总包数大于0，可能是网络问题
+        if time_since_last_packet > 60 and self._last_packet_count > 0:
+            current_count = self._packet_global_index
+            # 检查是否真的没有新包
+            if current_count == self._last_packet_count:
+                logging.warning(f"检测到可能的网络问题：{time_since_last_packet:.0f}秒未收到新数据包")
+                self._update_network_status("warning")
+            else:
+                # 有新包，恢复正常
+                self._update_network_status("normal")
+        else:
+            # 正常状态
+            if time_since_last_packet <= 60:
+                self._update_network_status("normal")
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    app = PacketCaptureApp()
-    app.mainloop()
+    app = QApplication([])
+    window = PacketCaptureApp()
+    window.showMaximized()  # 默认最大化显示
+    app.exec()
 
 
 if __name__ == "__main__":
     main()
-

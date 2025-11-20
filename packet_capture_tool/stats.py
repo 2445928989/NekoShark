@@ -24,16 +24,17 @@ class TrafficStats:
 
     def register(self, packet: ParsedPacket) -> None:
         self.total_packets += 1
+        
+        # 统一协议名称为大写，避免重复
         for protocol in packet.protocols:
+            # 跳过 Ethernet，只统计有意义的协议
+            if protocol.upper() == "ETHERNET":
+                continue
             self._protocol_counts[protocol.upper()] += 1
+        
+        # DNS 已经在 protocols 中了，不需要重复计数
         if "DNS" in packet.protocols:
             self._protocol_counts["DNS"] -= 1
-
-        # 为 IPv4 和 IPv6 添加特定计数
-        if "IPv4" in packet.network_layer.get("version", ""):
-            self._protocol_counts["IPv4"] += 1
-        elif "IPv6" in packet.network_layer.get("version", ""):
-            self._protocol_counts["IPv6"] += 1
 
         timestamp = packet.timestamp.replace(second=0, microsecond=0)
         ipv6_present = 1 if packet.network_layer.get("version") == "IPv6" else 0
@@ -69,8 +70,13 @@ class TrafficStats:
         return {key: self._protocol_counts.get(key, 0) for key in keys}
 
     def table_rows(self) -> List[Tuple[str, int]]:
-        counters = self.protocol_counters()
-        return [(name, counters[name]) for name in counters]
+        """ 返回所有非零计数的协议，按数量排序 """
+        # 过滤掉零计数，按数量降序
+        return sorted(
+            [(name, count) for name, count in self._protocol_counts.items() if count > 0],
+            key=lambda x: x[1],
+            reverse=True
+        )
 
     def merge_from(self, packets: Iterable[ParsedPacket]) -> None:
         for packet in packets:
