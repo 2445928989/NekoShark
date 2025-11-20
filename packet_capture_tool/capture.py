@@ -52,15 +52,21 @@ class CaptureManager:
             except Exception:  # pragma: no cover - defensive logging
                 logging.exception("处理捕获的数据包失败")
 
-        self._sniffer = AsyncSniffer(
-            filter=filter_expr,
-            prn=_safe_callback,
-            store=False,
-            iface=iface,
-            promisc=promisc,
-        )
-        self._sniffer.start()
-        logging.info("数据包捕获已启动，过滤器=%s 接口=%s", filter_expr, iface)
+        try:
+            self._sniffer = AsyncSniffer(
+                filter=filter_expr,
+                prn=_safe_callback,
+                store=False,
+                iface=iface,
+                promisc=promisc,
+            )
+            self._sniffer.start()
+            logging.info("数据包捕获已启动，过滤器=%s 接口=%s", filter_expr, iface)
+        except Exception as e:
+            # 捕获可能因为网络接口问题失败
+            logging.error(f"启动数据包捕获失败: {e}")
+            self._sniffer = None
+            raise
 
     def stop(self) -> None:
         if self._sniffer is not None:
