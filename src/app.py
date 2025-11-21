@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QPushButton, QLineEdit, QLabel,
     QTabWidget, QTreeWidget, QTreeWidgetItem, QFileDialog, QMessageBox,
     QHeaderView, QSplitter, QFrame, QCheckBox, QSpinBox, QGroupBox,
-    QDialog, QDialogButtonBox, QRadioButton, QButtonGroup
+    QDialog, QDialogButtonBox, QRadioButton, QButtonGroup, QComboBox
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QSettings
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon
@@ -303,6 +303,66 @@ class PacketCaptureApp(QMainWindow):
         self.network_check_timer.timeout.connect(self._check_network_status)
         self.network_check_timer.start(30000)  # 30秒
 
+    def _populate_interfaces(self) -> None:
+        """填充网络接口列表"""
+        self.interface_combo.clear()
+        
+        try:
+            from scapy.all import get_if_list, IFACES, conf
+            
+            # 添加"自动选择"选项
+            self.interface_combo.addItem("自动选择", None)
+            
+            interfaces = get_if_list()
+            active_interfaces = []
+            
+            for iface in interfaces:
+                try:
+                    iface_obj = IFACES.data.get(iface)
+                    if iface_obj:
+                        name = getattr(iface_obj, 'name', iface)
+                        description = getattr(iface_obj, 'description', '')
+                        ip = getattr(iface_obj, 'ip', '')
+                        
+                        # 构建显示文本
+                        if ip and ip != '0.0.0.0':
+                            display_text = f"{name} ({ip})"
+                            # 有 IP 的接口优先
+                            active_interfaces.insert(0, (display_text, iface))
+                        elif description and 'loopback' not in description.lower():
+                            display_text = f"{name} - {description[:40]}"
+                            active_interfaces.append((display_text, iface))
+                        else:
+                            display_text = name
+                            active_interfaces.append((display_text, iface))
+                    else:
+                        active_interfaces.append((iface, iface))
+                except:
+                    active_interfaces.append((iface, iface))
+            
+            # 添加所有接口
+            for display_text, iface_value in active_interfaces:
+                self.interface_combo.addItem(display_text, iface_value)
+            
+            # 尝试选择默认的活动接口
+            # 优先选择有 IP 且不是 169.254 开头的接口
+            default_selected = False
+            for i in range(1, self.interface_combo.count()):
+                iface_text = self.interface_combo.itemText(i)
+                if '(' in iface_text and ')' in iface_text:
+                    ip_part = iface_text.split('(')[1].split(')')[0]
+                    if not ip_part.startswith('169.254') and not ip_part.startswith('127.'):
+                        self.interface_combo.setCurrentIndex(i)
+                        default_selected = True
+                        break
+            
+            if not default_selected and self.interface_combo.count() > 1:
+                self.interface_combo.setCurrentIndex(1)  # 选择第一个非"自动"的接口
+                
+        except Exception as e:
+            logging.error(f"获取网络接口列表失败: {e}")
+            self.interface_combo.addItem("自动选择", None)
+
     def _build_ui(self) -> None:
         """构建UI"""
         central_widget = QWidget()
@@ -315,6 +375,15 @@ class PacketCaptureApp(QMainWindow):
         
         # 过滤器行
         filter_layout = QHBoxLayout()
+        
+        # 网络接口选择
+        filter_layout.addWidget(QLabel("网络接口:"))
+        self.interface_combo = QComboBox()
+        self.interface_combo.setMinimumWidth(200)
+        self.interface_combo.setMaximumWidth(300)
+        self._populate_interfaces()
+        filter_layout.addWidget(self.interface_combo)
+        
         filter_layout.addWidget(QLabel("BPF 过滤器:"))
         self.filter_input = QLineEdit()
         self.filter_input.setPlaceholderText("例如: tcp port 80")
@@ -1069,10 +1138,18 @@ class PacketCaptureApp(QMainWindow):
         self.start_button.setText("⏳ 启动中...")
 
         filter_expr = self.filter_input.text().strip() or None
+        
+        # 获取选择的网络接口
+        selected_iface = self.interface_combo.currentData()
+        if selected_iface is None:
+            # "自动选择"
+            iface = None
+        else:
+            iface = selected_iface
 
         def _start_capture_thread():
             try:
-                self.capture_manager.start(filter_expr=filter_expr)
+                self.capture_manager.start(filter_expr=filter_expr, iface=iface)
                 QTimer.singleShot(0, self._on_capture_started)
             except CaptureUnavailableError as exc:
                 QTimer.singleShot(0, lambda: self._on_capture_error("捕获不可用", str(exc)))
