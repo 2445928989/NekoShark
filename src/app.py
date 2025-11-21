@@ -1222,12 +1222,18 @@ class PacketCaptureApp(QMainWindow):
             QMessageBox.critical(self, "保存错误", str(exc))
 
     def load_capture(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(self, "打开捕获文件", "", "JSON Files (*.json)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "打开捕获文件", "", "JSON Files (*.json);;PCAP Files (*.pcap)")
         if not file_path:
             return
-        
         try:
-            packets = load_packets(Path(file_path))
+            p = Path(file_path)
+            if p.suffix.lower() == ".pcap":
+                # 导入 pcap 并解析为 ParsedPacket
+                from .storage import import_from_pcap
+
+                packets = import_from_pcap(p, extract_raw=True)
+            else:
+                packets = load_packets(p)
         except Exception as exc:
             QMessageBox.critical(self, "加载错误", str(exc))
             return
@@ -1239,12 +1245,22 @@ class PacketCaptureApp(QMainWindow):
         self._packet_global_index = 0
 
         for idx, packet in enumerate(packets):
-            self.stats.register(packet)
+            try:
+                self.stats.register(packet)
+            except Exception:
+                # 忽略统计错误，仍然加载包
+                logging.exception("统计注册失败")
             self.captured_packets.append((idx, packet))
             self._packet_cache[idx] = packet
             self._packet_global_index = idx + 1
 
         self._refresh_statistics()
+        # 刷新当前页面以显示已加载的数据包
+        try:
+            self._on_load_page()
+        except Exception:
+            logging.exception("加载后刷新页面失败")
+
         QMessageBox.information(self, "已加载", f"已加载 {len(packets)} 个数据包")
 
     def export_capture_pcap(self) -> None:
