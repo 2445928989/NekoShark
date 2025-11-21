@@ -1255,6 +1255,12 @@ class PacketCaptureApp(QMainWindow):
             self._packet_global_index = idx + 1
 
         self._refresh_statistics()
+        # 刷新当前页面以显示已加载的数据包
+        try:
+            self._on_load_page()
+        except Exception:
+            logging.exception("加载后刷新页面失败")
+
         QMessageBox.information(self, "已加载", f"已加载 {len(packets)} 个数据包")
 
     def export_capture_pcap(self) -> None:
