@@ -189,109 +189,119 @@ def export_to_pcap(path: Path, packets: Iterable[ParsedPacket]) -> None:
     if raw_entries_exist:
         if PcapWriter is None:
             raise RuntimeError("Scapy 未安装，无法导出 PCAP（需要写入原始字节）。请安装 scapy>=2.5")
+        
+        writer = None
         try:
             writer = PcapWriter(str(path), append=False, sync=True)
-        except Exception as e:
-            logging.error(f"创建 PcapWriter 失败: {e}")
-            raise
+            
+            for pkt in packets:
+                try:
+                    raw_b64 = getattr(pkt, "raw_b64", None)
+                    if raw_b64:
+                        raw_bytes = base64.b64decode(raw_b64)
+                        # 尝试用 Ether 解析原始字节为 Scapy Packet
+                        try:
+                            scapy_pkt = Ether(raw_bytes)
+                        except Exception:
+                            # 无法解析为以太网帧，则写入原始负载为 Raw
+                            scapy_pkt = Raw(raw_bytes)
 
-        for pkt in packets:
-            try:
-                raw_b64 = getattr(pkt, "raw_b64", None)
-                if raw_b64:
-                    raw_bytes = base64.b64decode(raw_b64)
-                    # 尝试用 Ether 解析原始字节为 Scapy Packet
-                    try:
-                        scapy_pkt = Ether(raw_bytes)
-                    except Exception:
-                        # 无法解析为以太网帧，则写入原始负载为 Raw
-                        scapy_pkt = Raw(raw_bytes)
-
-                    # 使用原始时间戳（若存在）
-                    ts = getattr(pkt, "orig_ts", None)
-                    if ts:
-                        writer.write(scapy_pkt, ts=float(ts))
-                    else:
+                        # 使用原始时间戳(若存在)
+                        ts = getattr(pkt, "orig_ts", None)
+                        if ts:
+                            # 设置数据包的时间戳
+                            scapy_pkt.time = float(ts)
                         writer.write(scapy_pkt)
-                else:
-                    # 回退到字段重建（兼容旧数据）
-                    # 构建最小 scapy 包（复用下方重建逻辑）
-                    net = pkt.network_layer
-                    trans = pkt.transport_layer
-                    sc = None
-                    if net and isinstance(net, dict) and net.get("src_mac") and net.get("dst_mac"):
-                        try:
-                            sc = Ether(src=net.get("src_mac"), dst=net.get("dst_mac"))
-                        except Exception:
-                            sc = Ether()
-
-                    ip_layer = None
-                    if net and net.get("version") == "IPv4":
-                        try:
-                            ip_kwargs = {}
-                            if net.get("src"):
-                                ip_kwargs["src"] = net.get("src")
-                            if net.get("dst"):
-                                ip_kwargs["dst"] = net.get("dst")
-                            ip_layer = IP(**ip_kwargs)
-                        except Exception:
-                            ip_layer = IP()
-                    elif net and net.get("version") == "IPv6":
-                        try:
-                            ipv6_kwargs = {}
-                            if net.get("src"):
-                                ipv6_kwargs["src"] = net.get("src")
-                            if net.get("dst"):
-                                ipv6_kwargs["dst"] = net.get("dst")
-                            ip_layer = IPv6(**ipv6_kwargs)
-                        except Exception:
-                            ip_layer = IPv6()
-
-                    trans_layer = None
-                    if trans and trans.get("type") == "TCP":
-                        try:
-                            tcp_kwargs = {}
-                            if trans.get("sport"):
-                                tcp_kwargs["sport"] = int(trans.get("sport"))
-                            if trans.get("dport"):
-                                tcp_kwargs["dport"] = int(trans.get("dport"))
-                            trans_layer = TCP(**tcp_kwargs)
-                        except Exception:
-                            trans_layer = TCP()
-                    elif trans and trans.get("type") == "UDP":
-                        try:
-                            udp_kwargs = {}
-                            if trans.get("sport"):
-                                udp_kwargs["sport"] = int(trans.get("sport"))
-                            if trans.get("dport"):
-                                udp_kwargs["dport"] = int(trans.get("dport"))
-                            trans_layer = UDP(**udp_kwargs)
-                        except Exception:
-                            trans_layer = UDP()
-
-                    composed = None
-                    if sc is not None:
-                        composed = sc
-                        if ip_layer is not None:
-                            composed = composed / ip_layer
                     else:
-                        if ip_layer is not None:
-                            composed = ip_layer
-                    if composed is None:
-                        composed = Raw(b"")
-                    if trans_layer is not None:
-                        composed = composed / trans_layer
+                        # 回退到字段重建（兼容旧数据）
+                        # 构建最小 scapy 包（复用下方重建逻辑）
+                        net = pkt.network_layer
+                        trans = pkt.transport_layer
+                        sc = None
+                        if net and isinstance(net, dict) and net.get("src_mac") and net.get("dst_mac"):
+                            try:
+                                sc = Ether(src=net.get("src_mac"), dst=net.get("dst_mac"))
+                            except Exception:
+                                sc = Ether()
 
-                    writer.write(composed)
-            except Exception:
-                logging.exception("写入 PcapWriter 时失败，跳过此包")
-                continue
+                        ip_layer = None
+                        if net and net.get("version") == "IPv4":
+                            try:
+                                ip_kwargs = {}
+                                if net.get("src"):
+                                    ip_kwargs["src"] = net.get("src")
+                                if net.get("dst"):
+                                    ip_kwargs["dst"] = net.get("dst")
+                                ip_layer = IP(**ip_kwargs)
+                            except Exception:
+                                ip_layer = IP()
+                        elif net and net.get("version") == "IPv6":
+                            try:
+                                ipv6_kwargs = {}
+                                if net.get("src"):
+                                    ipv6_kwargs["src"] = net.get("src")
+                                if net.get("dst"):
+                                    ipv6_kwargs["dst"] = net.get("dst")
+                                ip_layer = IPv6(**ipv6_kwargs)
+                            except Exception:
+                                ip_layer = IPv6()
 
-        # 关闭 writer
-        try:
-            writer.close()
-        except Exception:
-            pass
+                        trans_layer = None
+                        if trans and trans.get("type") == "TCP":
+                            try:
+                                tcp_kwargs = {}
+                                if trans.get("sport"):
+                                    tcp_kwargs["sport"] = int(trans.get("sport"))
+                                if trans.get("dport"):
+                                    tcp_kwargs["dport"] = int(trans.get("dport"))
+                                trans_layer = TCP(**tcp_kwargs)
+                            except Exception:
+                                trans_layer = TCP()
+                        elif trans and trans.get("type") == "UDP":
+                            try:
+                                udp_kwargs = {}
+                                if trans.get("sport"):
+                                    udp_kwargs["sport"] = int(trans.get("sport"))
+                                if trans.get("dport"):
+                                    udp_kwargs["dport"] = int(trans.get("dport"))
+                                trans_layer = UDP(**udp_kwargs)
+                            except Exception:
+                                trans_layer = UDP()
+
+                        composed = None
+                        if sc is not None:
+                            composed = sc
+                            if ip_layer is not None:
+                                composed = composed / ip_layer
+                        else:
+                            if ip_layer is not None:
+                                composed = ip_layer
+                        if composed is None:
+                            composed = Raw(b"")
+                        if trans_layer is not None:
+                            composed = composed / trans_layer
+
+                        writer.write(composed)
+                except Exception:
+                    logging.exception("写入 PcapWriter 时失败，跳过此包")
+                    continue
+
+        except Exception as e:
+            logging.error(f"导出 PCAP 失败: {e}")
+            if writer:
+                try:
+                    writer.close()
+                except:
+                    pass
+            raise
+        finally:
+            # 确保关闭 writer 并刷新缓冲区
+            if writer:
+                try:
+                    writer.flush()
+                    writer.close()
+                except Exception as e:
+                    logging.warning(f"关闭 PcapWriter 时出现警告: {e}")
         return
 
     # 否则回退到字段重建并一次性写入（原先逻辑）
